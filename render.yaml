@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: tg-mp3-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DB_PATH
+        value: /tmp/bot.db
