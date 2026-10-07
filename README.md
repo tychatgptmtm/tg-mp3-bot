@@ -1,0 +1,65 @@
+# 🎧 MP3 Downloader Bot
+
+Telegram-бот: отправляешь ссылку на трек или видео — получаешь готовый **MP3** с обложкой и тегами.
+
+## Возможности
+
+- **YouTube / YouTube Music** — скачивание напрямую
+- **VK Видео** (vk.com/video, vkvideo.ru) — напрямую
+- **SoundCloud** — напрямую
+- **Spotify** — трек находится по метаданным и скачивается лучшая доступная версия
+- Любые другие сайты, поддерживаемые [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- Красивое меню на inline-кнопках, прогресс скачивания, выбор качества (128 / 192 / 320 kbps)
+- Админ-панель: `/stats`, `/ban`, `/unban`, `/broadcast` (рассылка)
+- Автоматическое понижение качества для длинных треков, чтобы уложиться в лимит Telegram 50 МБ
+
+## Переменные окружения
+
+| Переменная | Обязательно | Описание |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | токен от [@BotFather](https://t.me/BotFather) |
+| `ADMIN_IDS` | — | ID админов через запятую (узнать: [@userinfobot](https://t.me/userinfobot)) |
+| `DB_PATH` | — | путь к SQLite (по умолчанию `data/bot.db`) |
+| `PORT` | — | порт health-check сервера (Render выставляет сам) |
+
+## Локальный запуск
+
+```bash
+pip install -r requirements.txt        # нужен ещё ffmpeg: apt install ffmpeg / brew install ffmpeg
+BOT_TOKEN=123:ABC ADMIN_IDS=123456789 python bot.py
+```
+
+## Деплой на Render
+
+1. На [render.com](https://render.com) → **New → Web Service** → подключи этот репозиторий.
+   - **Runtime:** Docker (Render сам найдёт `Dockerfile`; можно использовать и `render.yaml` — Blueprint).
+   - **Health Check Path:** `/`
+   - **Instance type:** Free.
+2. В **Environment** добавь переменные:
+   - `BOT_TOKEN` — токен бота
+   - `ADMIN_IDS` — твой Telegram ID
+3. Deploy. В логах появится `Бот запущен` — пиши боту `/start` 🚀
+
+### ⚠️ Важно про бесплатный тариф Render
+
+Бесплатный Web Service засыпает через ~15 минут без входящих запросов, и бот перестаёт отвечать. Решение — внешний пинг:
+
+1. Возьми URL сервиса `https://tg-mp3-bot-xxxx.onrender.com`.
+2. Заведи бесплатный монитор в [UptimeRobot](https://uptimerobot.com) с интервалом 5 минут на этот URL.
+3. Теперь бот будет работать круглосуточно.
+
+### Ограничения
+
+- Telegram Bot API принимает файлы до **50 МБ** — для очень длинных видео бот вернёт ошибку.
+- Spotify не отдаёт сами файлы, поэтому трек ищется по названию (качество как правило 320 kbps с YouTube).
+- Ссылки на плейлисты: скачивается первый трек.
+
+## Структура
+
+```
+bot.py         — логика бота (aiogram 3): меню, ссылки, админка, health-check
+downloader.py  — yt-dlp + FFmpeg: поиск, скачивание, конвертация в MP3
+database.py    — SQLite: пользователи, качество, баны, статистика
+Dockerfile     — образ с FFmpeg для Render
+render.yaml    — blueprint для деплоя
+```
