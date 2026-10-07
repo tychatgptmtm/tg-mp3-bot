@@ -7,6 +7,7 @@ Telegram-бот: пришлите ссылку (VK / YouTube / Spotify / SoundCl
   ADMIN_IDS  — ID администраторов через запятую
   DB_PATH    — путь к базе SQLite (по умолчанию data/bot.db)
   PORT       — порт health-check сервера (по умолчанию 10000)
+  PROXY_URL  — опционально: прокси для исходящих запросов yt-dlp
 """
 import asyncio
 import html
@@ -14,6 +15,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,7 +39,7 @@ from aiogram.types import (
 from database import db
 from downloader import DownloadError, URL_RE, process_url
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -78,7 +81,9 @@ HELP_TEXT = (
     "3️⃣ Через несколько секунд получишь MP3 с обложкой и тегами 🎵\n\n"
     "⚠️ Лимит Telegram — 50 МБ на файл. Для длинных видео качество "
     "автоматически понижается, чтобы файл влез.\n"
-    "⚠️ Для ссылок на плейлисты качаю первый трек."
+    "⚠️ Для ссылок на плейлисты качаю первый трек.\n"
+    "⚠️ YouTube иногда блокирует серверные запросы — тогда пробую обход, "
+    "а если совсем не пускает, повтори через минуту."
 )
 
 ABOUT_TEXT = (
@@ -404,6 +409,24 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _selfupdate_ytdlp() -> None:
+    """yt-dlp и YouTube играют в кошки-мышки: свежая версия критична.
+    Обновляемся при старте (тихо, в фоне, не мешаем работе если сети нет)."""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
+            timeout=180,
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            import yt_dlp
+            log.info("yt-dlp обновлён до %s", yt_dlp.version.__version__)
+        else:
+            log.warning("yt-dlp не обновился: %s", (r.stderr or b"")[:200])
+    except Exception as e:
+        log.warning("yt-dlp self-update пропущен: %s", e)
+
+
 def start_health_server() -> None:
     port = int(os.environ.get("PORT", 10000))
     server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
@@ -425,4 +448,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     start_health_server()
+    threading.Thread(target=_selfupdate_ytdlp, name="ytdlp-update", daemon=True).start()
     asyncio.run(main())
