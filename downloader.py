@@ -46,6 +46,9 @@ YT_CLIENT_SETS = [
 
 YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
+# Регулярка для вытаскивания URL из текста сообщения (используется в bot.py)
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+
 RETRY_MARKERS = (
     "sign in", "not a bot", "confirm you", "login", "cookie",
     "http error 403", "http error 429", "http error 400",
