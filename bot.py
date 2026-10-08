@@ -35,7 +35,7 @@ from aiogram.types import (
 )
 
 from database import db
-from downloader import DownloadError, URL_RE, process_query, process_url
+from downloader import DownloadError, URL_RE, process_url, search_tracks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
 log = logging.getLogger("bot")
@@ -77,7 +77,8 @@ HELP_TEXT = (
     "• soundcloud.com\n"
     "• open.spotify.com/track/…\n\n"
     "2️⃣ Отправь ссылку мне сообщением\n"
-    "   …или просто напиши <i>исполнитель — название</i> (например: tryavoid криминальное чтиво 2)\n"
+    "   …или просто напиши <i>исполнитель — название</i> (например: tryavoid криминальное чтиво 2) — "
+    "пришлю список, выбери нужный трек\n"
     "3️⃣ Через несколько секунд получишь MP3 с обложкой и тегами 🎵\n\n"
     "⚠️ Лимит Telegram — 50 МБ на файл. Для длинных видео качество "
     "автоматически понижается, чтобы файл влез.\n"
@@ -249,29 +250,83 @@ async def cb_set_quality(c: CallbackQuery):
                      quality_menu(q))
 
 
-# ------------------------------------------------------------------ приём ссылок
+# ------------------------------------------------------------------ поиск списком
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def on_any_text(m: Message):
-    text = (m.text or "").strip()
-    if m.from_user is None:
-        return
-    if db.is_banned(m.from_user.id):
-        return
-    url_match = URL_RE.search(text)
-    query = None
-    if url_match:
-        url = url_match.group(0).rstrip(").,;")
-    else:
-        url, query = "", text
-        if len(query) < 2:
-            await m.reply("🤔 Пришли ссылку на трек или напиши исполнителя и название.")
-            return
-    db.add_user(m.from_user)
-    stored = db.get_user(m.from_user.id) or {}
+PAGE_SIZE = 10
+SEARCH_TTL = 6 * 60 * 60          # результаты поиска живут 6 часов
+SEARCH_MAX = 1000                 # сколько поисков держим в памяти
+_searches: dict = {}              # sid -> {"q", "items", "uid", "t"}
+_sid_counter = {"n": 0}
+
+
+def _new_sid() -> str:
+    _sid_counter["n"] += 1
+    n, chars, out = _sid_counter["n"], "0123456789abcdefghijklmnopqrstuvwxyz", ""
+    while n:
+        n, r = divmod(n, 36)
+        out = chars[r] + out
+    return out
+
+
+def _prune_searches() -> None:
+    now = time.time()
+    for sid in [k for k, v in _searches.items() if now - v["t"] > SEARCH_TTL]:
+        _searches.pop(sid, None)
+    while len(_searches) > SEARCH_MAX:
+        _searches.pop(next(iter(_searches)))
+
+
+def _fmt_dur(sec: int) -> str:
+    if not sec:
+        return "—:—"
+    h, rem = divmod(int(sec), 3600)
+    mnt, s = divmod(rem, 60)
+    return f"{h}:{mnt:02d}:{s:02d}" if h else f"{mnt}:{s:02d}"
+
+
+def _item_text(it: dict) -> str:
+    name = f"{it['artist']} - {it['title']}" if it["artist"] else it["title"]
+    return f"{_fmt_dur(it['duration'])} {name}"[:60]
+
+
+def search_page(sid: str, page: int):
+    data = _searches[sid]
+    items = data["items"]
+    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for i in range(page * PAGE_SIZE, min(len(items), (page + 1) * PAGE_SIZE)):
+        rows.append([InlineKeyboardButton(text=_item_text(items[i]), callback_data=f"t:{sid}:{i}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="‹‹", callback_data=f"p:{sid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1} / {pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="››", callback_data=f"p:{sid}:{page + 1}"))
+        rows.append(nav)
+    text = f"🎶 Аудиозаписи по запросу «<b>{html.escape(data['q'])}</b>»\n<i>Нажми на трек — пришлю MP3</i>"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+_bot_username = {"v": None}
+
+
+async def _caption_footer(bot: Bot) -> str:
+    if _bot_username["v"] is None:
+        try:
+            _bot_username["v"] = (await bot.me()).username or ""
+        except Exception:
+            return ""
+    u = _bot_username["v"]
+    return f'\n🔎 <a href="https://t.me/{u}">Найти другую песню</a>' if u else ""
+
+
+async def deliver(m: Message, user_id: int, url: str, meta: dict = None) -> None:
+    """Скачивает трек по ссылке и отправляет MP3 в чат сообщения m."""
+    stored = db.get_user(user_id) or {}
     quality = stored.get("quality", 192)
-
-    status = await m.answer("🔎 <i>Ищу трек…</i>")
+    status = await m.answer("⏳ <i>Скачиваю…</i>" if meta else "🔎 <i>Ищу трек…</i>")
     loop = asyncio.get_running_loop()
     last_progress = {"t": 0.0}
 
@@ -286,25 +341,18 @@ async def on_any_text(m: Message):
 
     result = None
     try:
-        if query:
-            result = await process_query(query, quality, progress_cb=progress, loop=loop)
-        else:
-            result = await process_url(url, quality, progress_cb=progress, loop=loop)
+        result = await process_url(url, quality, progress_cb=progress, loop=loop, meta=meta)
         await _safe_edit(status, "🎛 <i>Конвертирую в MP3 и вшиваю теги с обложкой…</i>")
 
-        caption_parts = [f"🎵 <b>{html.escape(result['title'])}</b>"]
-        if result["performer"]:
-            caption_parts.append(f"🎙 {html.escape(result['performer'])}")
-        caption_parts.append(f"🎚 {result['quality']} kbps · {result['size_mb']} МБ")
-
+        caption = f"🎚 {result['quality']} kbps · {result['size_mb']} МБ" + await _caption_footer(m.bot)
         await m.answer_audio(
             FSInputFile(result["path"]),
             title=(result["title"] or "audio")[:64],
             performer=(result["performer"] or None),
             duration=result["duration"],
-            caption="\n".join(caption_parts),
+            caption=caption,
         )
-        db.add_download(m.from_user.id)
+        db.add_download(user_id)
         await status.delete()
     except DownloadError as e:
         await _safe_edit(status, f"❌ {e}")
@@ -315,11 +363,84 @@ async def on_any_text(m: Message):
         else:
             await _safe_edit(status, "❌ Ошибка Telegram, попробуй ещё раз.")
     except Exception:
-        log.exception("Неожиданная ошибка при обработке %s", url or query)
+        log.exception("Неожиданная ошибка при обработке %s", url)
         await _safe_edit(status, "❌ Что-то пошло не так. Попробуй ещё раз.")
     finally:
         if result:
             shutil.rmtree(result["tmpdir"], ignore_errors=True)
+
+
+# ------------------------------------------------------------------ приём ссылок и запросов
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def on_any_text(m: Message):
+    text = (m.text or "").strip()
+    if m.from_user is None:
+        return
+    if db.is_banned(m.from_user.id):
+        return
+    db.add_user(m.from_user)
+
+    url_match = URL_RE.search(text)
+    if url_match:
+        await deliver(m, m.from_user.id, url_match.group(0).rstrip(").,;"))
+        return
+
+    query = re.sub(r"\s+", " ", text)[:200]
+    if len(query) < 2:
+        await m.reply("🤔 Пришли ссылку на трек или напиши исполнителя и название.")
+        return
+    status = await m.answer("🔎 <i>Ищу треки…</i>")
+    try:
+        items = await search_tracks(query)
+    except DownloadError as e:
+        await _safe_edit(status, f"❌ {e}")
+        return
+    except Exception:
+        log.exception("Ошибка поиска %s", query)
+        await _safe_edit(status, "❌ Поиск сейчас не работает, попробуй ещё раз.")
+        return
+    _prune_searches()
+    sid = _new_sid()
+    _searches[sid] = {"q": query, "items": items, "uid": m.from_user.id, "t": time.time()}
+    text, kb = search_page(sid, 0)
+    await _safe_edit(status, text, kb)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery):
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("p:"))
+async def cb_search_page(c: CallbackQuery):
+    try:
+        _, sid, page = (c.data or "").split(":")
+        page = int(page)
+    except ValueError:
+        return await c.answer()
+    if sid not in _searches or c.message is None:
+        return await c.answer("Поиск устарел — отправь запрос заново 🔎", show_alert=True)
+    text, kb = search_page(sid, page)
+    await _safe_edit(c.message, text, kb)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("t:"))
+async def cb_search_pick(c: CallbackQuery):
+    if c.from_user is None or c.message is None:
+        return await c.answer()
+    if db.is_banned(c.from_user.id):
+        return await c.answer()
+    try:
+        _, sid, idx = (c.data or "").split(":")
+        item = _searches[sid]["items"][int(idx)]
+    except (ValueError, KeyError, IndexError):
+        return await c.answer("Поиск устарел — отправь запрос заново 🔎", show_alert=True)
+    await c.answer(f"⏳ {item['title'][:150]}")
+    db.add_user(c.from_user)
+    await deliver(c.message, c.from_user.id, item["url"],
+                  meta={"artist": item["artist"], "title": item["title"]})
 
 
 # ------------------------------------------------------------------ админ-хендлеры

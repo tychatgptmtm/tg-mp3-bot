@@ -320,6 +320,82 @@ def _friendly_error(exc: Exception) -> str:
     return "Не удалось скачать 😔 Попробуй другую ссылку или повтори позже."
 
 
+# ------------------------------------------------------------------ поиск списком
+
+_SEP_RE = re.compile(r"\s+(?:-{1,2}|–|—)\s+")
+
+
+def _clean_name(name: str) -> str:
+    return re.sub(r"\s*-\s*Topic$", "", (name or "").strip(), flags=re.I).strip()
+
+
+def _entry_label(e: dict):
+    """Возвращает (исполнитель, название) для результата поиска."""
+    title = re.sub(r"\s+", " ", (e.get("title") or "").strip())
+    author = _clean_name(e.get("artist") or e.get("uploader") or e.get("channel") or "")
+    parts = _SEP_RE.split(title, maxsplit=1)
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0].strip(), parts[1].strip()
+    return author, title
+
+
+def _search_sync(query: str):
+    opts = _base_opts()
+    opts.update({"skip_download": True, "extract_flat": "in_playlist", "noplaylist": False})
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(query, download=False)
+
+
+async def search_tracks(query: str, limit: int = 50) -> list:
+    """Поиск треков списком: SoundCloud + YouTube.
+    Возвращает list[dict(url, artist, title, duration, source)]."""
+    query = re.sub(r"\s+", " ", query).strip()[:200]
+    if len(query) < 2:
+        raise DownloadError("Слишком короткий запрос 😕 Напиши исполнителя и название трека.")
+
+    async def one(prefix: str, n: int, source: str):
+        try:
+            info = await _run(_search_sync, f"{prefix}{n}:{query}")
+        except Exception as e:
+            log.info("search %s: %s", source, str(e)[:160])
+            return []
+        out = []
+        for e in info.get("entries") or []:
+            if not e:
+                continue
+            url = e.get("url") or e.get("webpage_url")
+            if not url:
+                continue
+            if not str(url).startswith("http"):
+                url = f"https://www.youtube.com/watch?v={url}"
+            dur = int(e.get("duration") or 0)
+            if dur and dur > 2 * 60 * 60:  # часовые миксы не влезут в 50 МБ
+                continue
+            artist, title = _entry_label(e)
+            if not title:
+                continue
+            out.append({"url": url, "artist": artist, "title": title,
+                        "duration": dur, "source": source})
+        return out
+
+    yt, sc = await asyncio.gather(one("ytsearch", 25, "yt"), one("scsearch", 30, "sc"))
+
+    # чередуем YouTube и SoundCloud, убираем дубли
+    merged, seen = [], set()
+    for i in range(max(len(yt), len(sc))):
+        for lst in (yt, sc):
+            if i < len(lst):
+                it = lst[i]
+                key = (re.sub(r"\W+", "", (it["artist"] + it["title"]).lower()), it["duration"] // 3)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(it)
+    if not merged:
+        raise DownloadError("Ничего не нашлось 😕 Попробуй уточнить: исполнитель — название.")
+    return merged[:limit]
+
+
 # ------------------------------------------------------------------ основной пайплайн
 
 async def process_query(query: str, preferred_quality: int = 192, progress_cb=None, loop=None):
@@ -331,7 +407,7 @@ async def process_query(query: str, preferred_quality: int = 192, progress_cb=No
 
 
 async def process_url(url: str, preferred_quality: int = 192, progress_cb=None, loop=None,
-                      search_query: str = None):
+                      search_query: str = None, meta: dict = None):
     """
     Возвращает dict: path, tmpdir, title, performer, duration, quality, size_mb.
     Вызывающий обязан удалить tmpdir после отправки!
@@ -409,11 +485,14 @@ async def process_url(url: str, preferred_quality: int = 192, progress_cb=None, 
         shutil.rmtree(tmp, ignore_errors=True)
         raise DownloadError("Файл больше 50 МБ — Telegram не примет 😔")
 
+    performer = info.get("artist") or _clean_name(info.get("uploader") or info.get("channel") or "")
+    if meta and meta.get("title"):
+        title, performer = meta["title"], meta.get("artist") or performer
     return {
         "path": path,
         "tmpdir": tmp,
         "title": title,
-        "performer": info.get("artist") or info.get("uploader") or info.get("channel") or "",
+        "performer": performer,
         "duration": duration or None,
         "quality": quality,
         "size_mb": round(size_mb, 1),
