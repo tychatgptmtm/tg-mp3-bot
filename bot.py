@@ -15,8 +15,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,7 +35,7 @@ from aiogram.types import (
 )
 
 from database import db
-from downloader import DownloadError, URL_RE, process_url
+from downloader import DownloadError, URL_RE, process_query, process_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
 log = logging.getLogger("bot")
@@ -65,8 +63,9 @@ WELCOME_TPL = (
     "• YouTube / YouTube Music\n"
     "• VK Видео\n"
     "• SoundCloud\n"
-    "• Spotify (нахожу и качаю лучшую версию трека)\n\n"
-    "Просто пришли мне ссылку — остальное сделаю сам 🚀\n"
+    "• Spotify (нахожу и качаю лучшую версию трека)\n"
+    "• Поиск по названию 🔎\n\n"
+    "Пришли ссылку — или просто напиши <i>исполнитель — название</i>, найду сам 🔎\n"
     "🎚 Текущее качество: <b>{q} kbps</b>"
 )
 
@@ -78,6 +77,7 @@ HELP_TEXT = (
     "• soundcloud.com\n"
     "• open.spotify.com/track/…\n\n"
     "2️⃣ Отправь ссылку мне сообщением\n"
+    "   …или просто напиши <i>исполнитель — название</i> (например: tryavoid криминальное чтиво 2)\n"
     "3️⃣ Через несколько секунд получишь MP3 с обложкой и тегами 🎵\n\n"
     "⚠️ Лимит Telegram — 50 МБ на файл. Для длинных видео качество "
     "автоматически понижается, чтобы файл влез.\n"
@@ -253,20 +253,23 @@ async def cb_set_quality(c: CallbackQuery):
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_any_text(m: Message):
-    text = m.text or ""
-    url_match = URL_RE.search(text)
-    if not url_match:
-        await m.reply("🤔 Похоже, здесь нет ссылки.\n"
-                      "Пришли ссылку на трек или видео: YouTube, VK, SoundCloud или Spotify.")
-        return
+    text = (m.text or "").strip()
     if m.from_user is None:
         return
     if db.is_banned(m.from_user.id):
         return
+    url_match = URL_RE.search(text)
+    query = None
+    if url_match:
+        url = url_match.group(0).rstrip(").,;")
+    else:
+        url, query = "", text
+        if len(query) < 2:
+            await m.reply("🤔 Пришли ссылку на трек или напиши исполнителя и название.")
+            return
     db.add_user(m.from_user)
     stored = db.get_user(m.from_user.id) or {}
     quality = stored.get("quality", 192)
-    url = url_match.group(0).rstrip(").,;")
 
     status = await m.answer("🔎 <i>Ищу трек…</i>")
     loop = asyncio.get_running_loop()
@@ -283,7 +286,10 @@ async def on_any_text(m: Message):
 
     result = None
     try:
-        result = await process_url(url, quality, progress_cb=progress, loop=loop)
+        if query:
+            result = await process_query(query, quality, progress_cb=progress, loop=loop)
+        else:
+            result = await process_url(url, quality, progress_cb=progress, loop=loop)
         await _safe_edit(status, "🎛 <i>Конвертирую в MP3 и вшиваю теги с обложкой…</i>")
 
         caption_parts = [f"🎵 <b>{html.escape(result['title'])}</b>"]
@@ -309,7 +315,7 @@ async def on_any_text(m: Message):
         else:
             await _safe_edit(status, "❌ Ошибка Telegram, попробуй ещё раз.")
     except Exception:
-        log.exception("Неожиданная ошибка при обработке %s", url)
+        log.exception("Неожиданная ошибка при обработке %s", url or query)
         await _safe_edit(status, "❌ Что-то пошло не так. Попробуй ещё раз.")
     finally:
         if result:
@@ -339,7 +345,7 @@ async def cb_admin_stats(c: CallbackQuery):
 @admin_router.message(Command("ban"))
 async def cmd_ban(m: Message, command: CommandObject):
     if not command.args or not command.args.strip().isdigit():
-        return await m.answer("Использование: /ban <user_id>")
+        return await m.answer("Использование: /ban &lt;user_id&gt;")
     uid = int(command.args.strip())
     if uid in ADMIN_IDS:
         return await m.answer("Нельзя забанить администратора 🙂")
@@ -350,7 +356,7 @@ async def cmd_ban(m: Message, command: CommandObject):
 @admin_router.message(Command("unban"))
 async def cmd_unban(m: Message, command: CommandObject):
     if not command.args or not command.args.strip().isdigit():
-        return await m.answer("Использование: /unban <user_id>")
+        return await m.answer("Использование: /unban &lt;user_id&gt;")
     uid = int(command.args.strip())
     db.set_ban(uid, False)
     await m.answer(f"✅ Пользователь <code>{uid}</code> разбанен.")
@@ -360,7 +366,7 @@ async def cmd_unban(m: Message, command: CommandObject):
 async def cmd_broadcast(m: Message, command: CommandObject):
     text = (command.args or "").strip()
     if not text:
-        return await m.answer("Использование: /broadcast <текст сообщения>")
+        return await m.answer("Использование: /broadcast &lt;текст сообщения&gt;")
     ids = db.all_user_ids()
     status = await m.answer(f"📢 Рассылка запущена: {len(ids)} получателей…")
     sent = failed = 0
@@ -405,26 +411,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):  # noqa: N802
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, *args):  # тише в логах
         pass
-
-
-def _selfupdate_ytdlp() -> None:
-    """yt-dlp и YouTube играют в кошки-мышки: свежая версия критична.
-    Обновляемся при старте (тихо, в фоне, не мешаем работе если сети нет)."""
-    try:
-        r = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
-            timeout=180,
-            capture_output=True,
-        )
-        if r.returncode == 0:
-            import yt_dlp
-            log.info("yt-dlp обновлён до %s", yt_dlp.version.__version__)
-        else:
-            log.warning("yt-dlp не обновился: %s", (r.stderr or b"")[:200])
-    except Exception as e:
-        log.warning("yt-dlp self-update пропущен: %s", e)
 
 
 def start_health_server() -> None:
@@ -448,5 +440,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     start_health_server()
-    threading.Thread(target=_selfupdate_ytdlp, name="ytdlp-update", daemon=True).start()
     asyncio.run(main())

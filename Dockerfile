@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
-# FFmpeg нужен для конвертации в MP3 и вшивания обложек
+# FFmpeg — конвертация в MP3 и обложки; Deno — JS-рантайм, нужен yt-dlp для YouTube
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg curl unzip ca-certificates \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
