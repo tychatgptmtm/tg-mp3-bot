@@ -34,6 +34,8 @@ YouTube часто блокирует запросы с IP датацентро�
 | `DB_PATH` | — | путь к SQLite (по умолчанию `data/bot.db`) |
 | `PORT` | — | порт health-check сервера (Render выставляет сам) |
 | `PROXY_URL` | — | прокси для yt-dlp, если YouTube жёстко блокирует регион датацентра |
+| `VK_TOKEN` | — | токен Kate Mobile (vkhost.github.io) — включает поиск и скачивание музыки VK |
+| `VK_UA` | Kate Mobile | User-Agent для VK API (менять, только если токен от другого приложения) |
 | `YT_COOKIES` | — | содержимое `cookies.txt` с youtube.com (без него YouTube на Render не качается) |
 
 ## Локальный запуск

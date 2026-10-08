@@ -4,6 +4,7 @@
 Поддержка:
   • YouTube / YouTube Music (на серверных IP нужны cookies — YT_COOKIES — или PROXY_URL)
   • VK Видео
+  • Музыка VK (vk.com/audio…, посты с музыкой, поиск) — нужен VK_TOKEN
   • SoundCloud
   • Spotify — берём «исполнитель — название» и ищем на YouTube / SoundCloud
 """
@@ -157,6 +158,192 @@ async def resolve_spotify(url: str) -> str:
 # ------------------------------------------------------------------ VK audio/topic
 
 VK_AUDIO_RE = re.compile(r"(?:vk\.com|vk\.ru|m\.vk\.com)/(audio|topic|wall)-?\d+_\d+", re.I)
+_VK_AUDIO_ID_RE = re.compile(r"audio(-?\d+_\d+(?:_[0-9a-f]+)?)", re.I)
+_VK_WALL_ID_RE = re.compile(r"wall(-?\d+_\d+)", re.I)
+
+# VK_TOKEN — токен Kate Mobile (vkhost.github.io). Без него музыка VK недоступна.
+VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
+VK_API_VERSION = "5.131"
+VK_UA = os.environ.get("VK_UA", "").strip() or (
+    "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; "
+    "unknown Android SDK built for x86; en)")
+VK_PREFIX = "vkaudio:"
+log.warning("VK_TOKEN: %s", "задан — музыка VK включена" if VK_TOKEN else "не задан — музыка VK выключена")
+
+VK_NO_TOKEN_MSG = (
+    "Музыка VK пока не подключена 😔\n"
+    "Напиши исполнителя и название — найду трек на YouTube или SoundCloud 🔎"
+)
+
+
+async def _vk_api(method: str, **params):
+    if not VK_TOKEN:
+        raise DownloadError(VK_NO_TOKEN_MSG)
+    params.update({"access_token": VK_TOKEN, "v": VK_API_VERSION})
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": VK_UA}, timeout=timeout) as session:
+            async with session.post(f"https://api.vk.com/method/{method}", data=params) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("VK %s: сеть: %s", method, str(e)[:200])
+        raise DownloadError("VK не отвечает, попробуй ещё раз 😔")
+    if "error" in data:
+        err = data["error"]
+        code, msg = err.get("error_code"), err.get("error_msg", "")
+        log.warning("VK %s: ошибка %s — %s", method, code, msg)
+        if code == 5:
+            raise DownloadError("Токен VK устарел или неверный — его нужно обновить 😔")
+        if code in (15, 201, 203):
+            raise DownloadError("VK не даёт доступ к этой аудиозаписи 😔")
+        if code in (6, 9, 29):
+            raise DownloadError("VK просит подождать — слишком много запросов, повтори через минуту 😔")
+        if code == 14:
+            raise DownloadError("VK просит капчу — повтори чуть позже 😔")
+        raise DownloadError(f"VK вернул ошибку ({code}) 😔")
+    return data.get("response")
+
+
+def _vk_full_id(a: dict) -> str:
+    fid = f"{a['owner_id']}_{a['id']}"
+    if a.get("access_key"):
+        fid += f"_{a['access_key']}"
+    return fid
+
+
+def _vk_cover(a: dict):
+    thumb = ((a.get("album") or {}).get("thumb") or {})
+    for k in ("photo_600", "photo_300", "photo_270", "photo_135"):
+        if thumb.get(k):
+            return thumb[k]
+    return None
+
+
+async def vk_search(query: str, count: int = 30) -> list:
+    if not VK_TOKEN:
+        return []
+    try:
+        resp = await _vk_api("audio.search", q=query, count=count, auto_complete=1, sort=2)
+    except DownloadError as e:
+        log.info("search vk: %s", e)
+        return []
+    out = []
+    for a in (resp or {}).get("items") or []:
+        if not a.get("title"):
+            continue
+        dur = int(a.get("duration") or 0)
+        if dur > 2 * 60 * 60:
+            continue
+        out.append({"url": VK_PREFIX + _vk_full_id(a), "artist": (a.get("artist") or "").strip(),
+                    "title": a["title"].strip(), "duration": dur, "source": "vk"})
+    return out
+
+
+async def _vk_resolve(url: str) -> dict:
+    """Ссылка VK / vkaudio:<id> → объект аудиозаписи с прямым url."""
+    if url.startswith(VK_PREFIX):
+        ids = [url[len(VK_PREFIX):]]
+    elif _VK_AUDIO_ID_RE.search(url):
+        ids = [_VK_AUDIO_ID_RE.search(url).group(1)]
+    elif _VK_WALL_ID_RE.search(url):
+        posts = await _vk_api("wall.getById", posts=_VK_WALL_ID_RE.search(url).group(1))
+        if isinstance(posts, dict):
+            posts = posts.get("items")
+        ids = []
+        for post in posts or []:
+            atts = list(post.get("attachments") or [])
+            for rep in post.get("copy_history") or []:
+                atts += rep.get("attachments") or []
+            ids += [_vk_full_id(x["audio"]) for x in atts if x.get("type") == "audio"]
+        if not ids:
+            raise DownloadError("В этом посте нет аудиозаписей 😕")
+    else:
+        raise DownloadError("Не понял ссылку VK 😕 Пришли ссылку на аудиозапись или пост с музыкой.")
+    items = await _vk_api("audio.getById", audios=ids[0])
+    if not items:
+        raise DownloadError("Аудиозапись VK не найдена или удалена 😔")
+    a = items[0]
+    if not a.get("url"):
+        raise DownloadError("Эта песня недоступна в VK (ограничение правообладателя или региона) 😔")
+    return a
+
+
+async def _ffmpeg(*args) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise DownloadError("VK долго отдаёт трек, попробуй ещё раз 😔")
+    if proc.returncode != 0:
+        log.warning("ffmpeg: %s", (err or b"").decode(errors="ignore")[-400:])
+        raise DownloadError("Не удалось скачать трек из VK 😔")
+
+
+async def process_vk(url: str, preferred_quality: int = 192, progress_cb=None, meta: dict = None):
+    a = await _vk_resolve(url)
+    artist = (a.get("artist") or "").strip()
+    title = (a.get("title") or "audio").strip()
+    duration = int(a.get("duration") or 0)
+    quality = _pick_quality(duration, preferred_quality) if duration else preferred_quality
+    if duration and quality is None:
+        raise DownloadError(f"Слишком длинный трек ({duration // 60} мин) — не влезет в 50 МБ 😔")
+    if progress_cb:
+        try:
+            await progress_cb(f"⬇️ <i>Скачиваю «{html.escape(title)}» из VK…</i>")
+        except Exception:
+            pass
+
+    tmp = tempfile.mkdtemp(prefix="mp3bot_")
+    try:
+        cover = None
+        cover_url = _vk_cover(a)
+        if cover_url:
+            try:
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(cover_url) as resp:
+                        if resp.status == 200:
+                            cover = os.path.join(tmp, "cover.jpg")
+                            with open(cover, "wb") as f:
+                                f.write(await resp.read())
+            except Exception:
+                cover = None
+
+        path = os.path.join(tmp, "track.mp3")
+        args = ["-user_agent", VK_UA,
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls",
+                "-i", a["url"]]
+        if cover:
+            args += ["-i", cover, "-map", "0:a", "-map", "1:v", "-c:v", "mjpeg",
+                     "-disposition:v", "attached_pic",
+                     "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+        else:
+            args += ["-map", "0:a"]
+        args += ["-c:a", "libmp3lame", "-b:a", f"{quality}k", "-id3v2_version", "3",
+                 "-metadata", f"title={title}", "-metadata", f"artist={artist}", path]
+        await _ffmpeg(*args)
+
+        size_mb = os.path.getsize(path) / 1024 / 1024
+        if size_mb > 49.5:
+            raise DownloadError("Файл больше 50 МБ — Telegram не примет 😔")
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    return {
+        "path": path,
+        "tmpdir": tmp,
+        "title": title,
+        "performer": artist,
+        "duration": duration or None,
+        "quality": quality,
+        "size_mb": round(size_mb, 1),
+        "source_url": "https://vk.com/audio" + _vk_full_id(a),
+    }
+
 
 
 # ------------------------------------------------------------------ утилиты
@@ -347,7 +534,7 @@ def _search_sync(query: str):
 
 
 async def search_tracks(query: str, limit: int = 50) -> list:
-    """Поиск треков списком: SoundCloud + YouTube.
+    """Поиск треков списком: VK (если есть VK_TOKEN) + YouTube + SoundCloud.
     Возвращает list[dict(url, artist, title, duration, source)]."""
     query = re.sub(r"\s+", " ", query).strip()[:200]
     if len(query) < 2:
@@ -378,12 +565,13 @@ async def search_tracks(query: str, limit: int = 50) -> list:
                         "duration": dur, "source": source})
         return out
 
-    yt, sc = await asyncio.gather(one("ytsearch", 25, "yt"), one("scsearch", 30, "sc"))
+    vk, yt, sc = await asyncio.gather(vk_search(query, 30), one("ytsearch", 25, "yt"),
+                                      one("scsearch", 30, "sc"))
 
-    # чередуем YouTube и SoundCloud, убираем дубли
+    # чередуем VK, YouTube и SoundCloud, убираем дубли
     merged, seen = [], set()
-    for i in range(max(len(yt), len(sc))):
-        for lst in (yt, sc):
+    for i in range(max(len(vk), len(yt), len(sc))):
+        for lst in (vk, yt, sc):
             if i < len(lst):
                 it = lst[i]
                 key = (re.sub(r"\W+", "", (it["artist"] + it["title"]).lower()), it["duration"] // 3)
@@ -420,11 +608,8 @@ async def process_url(url: str, preferred_quality: int = 192, progress_cb=None, 
         query = await resolve_spotify(url)
         log.info("spotify -> %s", query)
         candidates = [f"scsearch1:{query}", f"ytsearch1:{query}"]
-    elif VK_AUDIO_RE.search(url):
-        raise DownloadError(
-            "Музыку VK (vk.com/audio) скачать нельзя — VK отдаёт её только авторизованным 😔\n"
-            "Просто напиши мне исполнителя и название — найду трек сам 🔎"
-        )
+    elif url.startswith(VK_PREFIX) or VK_AUDIO_RE.search(url):
+        return await process_vk(url, preferred_quality, progress_cb, meta)
     else:
         candidates = [url]
 

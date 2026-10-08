@@ -61,7 +61,7 @@ WELCOME_TPL = (
     "Привет, <b>{name}</b>! Я превращаю ссылки в готовые MP3-файлы.\n\n"
     "<b>Откуда умею качать:</b>\n"
     "• YouTube / YouTube Music\n"
-    "• VK Видео\n"
+    "• Музыка VK и VK Видео\n"
     "• SoundCloud\n"
     "• Spotify (нахожу и качаю лучшую версию трека)\n"
     "• Поиск по названию 🔎\n\n"
@@ -73,7 +73,7 @@ HELP_TEXT = (
     "📥 <b>Как скачать</b>\n\n"
     "1️⃣ Скопируй ссылку на трек или видео:\n"
     "• youtube.com, youtu.be, music.youtube.com\n"
-    "• vkvideo.ru, vk.com/video\n"
+    "• vk.com/audio…, посты VK с музыкой, vkvideo.ru\n"
     "• soundcloud.com\n"
     "• open.spotify.com/track/…\n\n"
     "2️⃣ Отправь ссылку мне сообщением\n"
@@ -284,12 +284,14 @@ def _fmt_dur(sec: int) -> str:
     return f"{h}:{mnt:02d}:{s:02d}" if h else f"{mnt}:{s:02d}"
 
 
-SOURCE_ICONS = {"yt": "🟥", "sc": "🟧"}
+SOURCE_ICONS = {"vk": "🟦", "yt": "🟥", "sc": "🟧"}
 SOURCE_NAMES = {"yt": "YouTube", "sc": "SoundCloud", "vk": "VK", "spotify": "Spotify"}
 
 
 def _source_of(url: str) -> str:
     u = (url or "").lower()
+    if u.startswith("vkaudio:"):
+        return "vk"
     if "youtube.com" in u or "youtu.be" in u:
         return "yt"
     if "soundcloud.com" in u:
@@ -323,7 +325,10 @@ def search_page(sid: str, page: int):
         if page < pages - 1:
             nav.append(InlineKeyboardButton(text="››", callback_data=f"p:{sid}:{page + 1}"))
         rows.append(nav)
-    text = f"🎶 Аудиозаписи по запросу «<b>{html.escape(data['q'])}</b>»\n<i>Нажми на трек — пришлю MP3</i>\n🟥 YouTube · 🟧 SoundCloud"
+    used = {it.get("source") for it in items}
+    legend = " · ".join(f"{SOURCE_ICONS[k]} {SOURCE_NAMES[k]}" for k in ("vk", "yt", "sc") if k in used)
+    text = (f"🎶 Аудиозаписи по запросу «<b>{html.escape(data['q'])}</b>»\n"
+            f"<i>Нажми на трек — пришлю MP3</i>\n{legend}")
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
