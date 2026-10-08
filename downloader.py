@@ -28,15 +28,53 @@ MAX_BYTES = MAX_FILE_MB * 1024 * 1024
 PROXY = os.environ.get("PROXY_URL", "").strip() or None
 
 
+_COOKIE_RE = re.compile(
+    r"(?P<domain>(?:#HttpOnly_)?[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+"
+    r"(?P<flag>TRUE|FALSE)\s+"
+    r"(?P<path>/\S*)\s+"
+    r"(?P<secure>TRUE|FALSE)\s+"
+    r"(?P<expiry>-?\d+)\s+"
+    r"(?P<name>[^\s=;]+)\s+"
+    r"(?P<value>\S*?)(?=\s|$|(?:#HttpOnly_)?\.(?:youtube|google)\.com\s)",
+)
+_LOGIN_COOKIES = ("LOGIN_INFO", "SAPISID", "__Secure-3PSID", "SID")
+
+
+def _normalize_cookies(raw: str):
+    """Чинит cookies, вставленные с телефона: табуляции → пробелы,
+    пропавшие переносы строк, буквальные \\n / \\t. Каждая запись
+    разбирается по 7 полям и собирается обратно в формат Netscape."""
+    text = raw.replace("\\t", "\t").replace("\\n", "\n").replace("\r", "\n")
+    # убираем комментарии (# Netscape HTTP Cookie File и т.п.), но не #HttpOnly_
+    text = re.sub(
+        r"#(?!HttpOnly_)[^\n]*?(?=(?:#HttpOnly_)?\.?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
+        r"\.[A-Za-z]{2,}\s+(?:TRUE|FALSE)\s|\n|$)",
+        " ", text)
+    cookies = []
+    for m in _COOKIE_RE.finditer(text):
+        cookies.append("\t".join(m.group("domain", "flag", "path", "secure",
+                                          "expiry", "name", "value")))
+    names = {c.split("\t")[5] for c in cookies}
+    logged_in = any(n in names for n in _LOGIN_COOKIES)
+    out = "# Netscape HTTP Cookie File\n" + "\n".join(cookies) + "\n"
+    return out, len(cookies), logged_in
+
+
 def _prepare_cookies():
     """YT_COOKIES — содержимое cookies.txt (формат Netscape) из браузера,
     где выполнен вход в YouTube. Пишем во временный файл для yt-dlp."""
     raw = os.environ.get("YT_COOKIES", "").strip()
     if not raw:
+        log.warning("YT_COOKIES: не задано — YouTube на Render может не качаться")
+        return None
+    content, count, logged_in = _normalize_cookies(raw)
+    log.warning("YT_COOKIES: распознано %d cookies, вход в аккаунт: %s",
+                count, "да" if logged_in else "НЕТ")
+    if not count:
         return None
     path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(raw.replace("\\n", "\n") + "\n")
+        f.write(content)
     return path
 
 
