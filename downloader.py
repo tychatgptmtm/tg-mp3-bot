@@ -168,7 +168,86 @@ VK_UA = os.environ.get("VK_UA", "").strip() or (
     "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; "
     "unknown Android SDK built for x86; en)")
 VK_PREFIX = "vkaudio:"
-log.warning("VK_TOKEN: %s", "задан — музыка VK включена" if VK_TOKEN else "не задан — музыка VK выключена")
+
+# VK_COOKIES — cookies.txt с vk.ru / vk.com из браузера, где выполнен вход.
+# Бот сам получает по ним веб-токен VK (как это делает сайт vk.com) и обновляет его.
+WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+VK_WEB_APP_ID = "6287487"
+
+
+def _parse_vk_cookies():
+    raw = os.environ.get("VK_COOKIES", "").strip()
+    if not raw:
+        return []
+    content, _, _ = _normalize_cookies(raw)
+    out = []
+    for line in content.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 7 and not line.startswith("# "):
+            domain = parts[0].replace("#HttpOnly_", "").lstrip(".").lower()
+            if domain.endswith(("vk.com", "vk.ru")):
+                out.append((domain, parts[5], parts[6]))
+    return out
+
+
+VK_COOKIES = _parse_vk_cookies()
+_vk_web = {"token": None, "exp": 0.0, "ua": WEB_UA}
+
+if VK_TOKEN:
+    log.warning("VK_TOKEN: задан — музыка VK включена")
+if VK_COOKIES:
+    names = {n for _, n, _ in VK_COOKIES}
+    doms = sorted({d for d, _, _ in VK_COOKIES})
+    log.warning("VK_COOKIES: распознано %d cookies (%s), сессия: %s", len(VK_COOKIES),
+                ", ".join(doms)[:200], "да" if names & {"remixsid", "remixnsid", "p", "l"} else "НЕТ")
+if not VK_TOKEN and not VK_COOKIES:
+    log.warning("VK: нет ни VK_TOKEN, ни VK_COOKIES — музыка VK выключена")
+
+
+def _cookie_header(host: str) -> str:
+    pairs = {}
+    for domain, name, value in VK_COOKIES:
+        if host == domain or host.endswith("." + domain):
+            pairs[name] = value
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
+async def _vk_web_token() -> str:
+    """Веб-токен VK по cookies (кэшируется до истечения)."""
+    import time as _time
+    if _vk_web["token"] and _time.time() < _vk_web["exp"] - 60:
+        return _vk_web["token"]
+    last = "нет ответа"
+    timeout = aiohttp.ClientTimeout(total=20)
+    for base in ("vk.ru", "vk.com"):
+        cookie = _cookie_header(f"login.{base}")
+        if not cookie:
+            continue
+        headers = {"User-Agent": WEB_UA, "Origin": f"https://{base}", "Referer": f"https://{base}/",
+                   "Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(f"https://login.{base}/?act=web_token", headers=headers,
+                                        data={"version": "1", "app_id": VK_WEB_APP_ID}) as resp:
+                    data = await resp.json(content_type=None)
+        except Exception as e:
+            last = str(e)[:150]
+            continue
+        if isinstance(data, dict) and data.get("type") == "okay":
+            d = data.get("data") or {}
+            if d.get("access_token"):
+                _vk_web["token"] = d["access_token"]
+                _vk_web["exp"] = float(d.get("expires") or (_time.time() + 3600))
+                log.warning("VK_COOKIES: веб-токен получен через login.%s (user_id=%s)", base, d.get("user_id"))
+                return _vk_web["token"]
+        last = str(data)[:200]
+    log.warning("VK_COOKIES: не удалось получить веб-токен: %s", last)
+    raise DownloadError("Cookies VK не подошли (сессия устарела или не та) — их нужно обновить 😔")
+
+
+def _vk_enabled() -> bool:
+    return bool(VK_TOKEN or VK_COOKIES)
 
 VK_NO_TOKEN_MSG = (
     "Музыка VK пока не подключена 😔\n"
@@ -176,32 +255,61 @@ VK_NO_TOKEN_MSG = (
 )
 
 
-async def _vk_api(method: str, **params):
-    if not VK_TOKEN:
-        raise DownloadError(VK_NO_TOKEN_MSG)
-    params.update({"access_token": VK_TOKEN, "v": VK_API_VERSION})
+async def _vk_call(method: str, token: str, ua: str, params: dict):
+    params = dict(params, access_token=token, v=VK_API_VERSION)
     timeout = aiohttp.ClientTimeout(total=20)
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": VK_UA}, timeout=timeout) as session:
+        async with aiohttp.ClientSession(headers={"User-Agent": ua}, timeout=timeout) as session:
             async with session.post(f"https://api.vk.com/method/{method}", data=params) as resp:
-                data = await resp.json(content_type=None)
+                return await resp.json(content_type=None)
     except Exception as e:
         log.warning("VK %s: сеть: %s", method, str(e)[:200])
         raise DownloadError("VK не отвечает, попробуй ещё раз 😔")
-    if "error" in data:
-        err = data["error"]
-        code, msg = err.get("error_code"), err.get("error_msg", "")
-        log.warning("VK %s: ошибка %s — %s", method, code, msg)
-        if code == 5:
-            raise DownloadError("Токен VK устарел или неверный — его нужно обновить 😔")
-        if code in (15, 201, 203):
-            raise DownloadError("VK не даёт доступ к этой аудиозаписи 😔")
-        if code in (6, 9, 29):
-            raise DownloadError("VK просит подождать — слишком много запросов, повтори через минуту 😔")
-        if code == 14:
-            raise DownloadError("VK просит капчу — повтори чуть позже 😔")
-        raise DownloadError(f"VK вернул ошибку ({code}) 😔")
-    return data.get("response")
+
+
+async def _vk_api(method: str, **params):
+    if not _vk_enabled():
+        raise DownloadError(VK_NO_TOKEN_MSG)
+    creds = []
+    if VK_TOKEN:
+        creds.append(("VK_TOKEN", lambda: VK_TOKEN, VK_UA))
+    if VK_COOKIES:
+        creds.append(("VK_COOKIES", _vk_web_token, WEB_UA))
+
+    data, err_exc = None, None
+    for i, (label, get_token, ua) in enumerate(creds):
+        try:
+            token = get_token()
+            if asyncio.iscoroutine(token):
+                token = await token
+        except DownloadError as e:
+            err_exc = e
+            continue
+        data = await _vk_call(method, token, ua, params)
+        if "error" not in data:
+            return data.get("response")
+        code = data["error"].get("error_code")
+        log.warning("VK %s [%s]: ошибка %s — %s", method, label, code, data["error"].get("error_msg", ""))
+        if code == 5 and label == "VK_COOKIES":
+            _vk_web["token"] = None
+        if code in (5, 15, 3) and i + 1 < len(creds):
+            continue  # пробуем следующий способ входа
+        break
+    if data is None or "error" not in data:
+        raise err_exc or DownloadError(VK_NO_TOKEN_MSG)
+
+    code = data["error"].get("error_code")
+    if code == 5:
+        raise DownloadError("Вход в VK устарел (токен или cookies) — их нужно обновить 😔")
+    if code == 15:
+        raise DownloadError("VK не даёт доступ к музыке с этим входом 😔")
+    if code in (201, 203):
+        raise DownloadError("VK не даёт доступ к этой аудиозаписи 😔")
+    if code in (6, 9, 29):
+        raise DownloadError("VK просит подождать — слишком много запросов, повтори через минуту 😔")
+    if code == 14:
+        raise DownloadError("VK просит капчу — повтори чуть позже 😔")
+    raise DownloadError(f"VK вернул ошибку ({code}) 😔")
 
 
 def _vk_full_id(a: dict) -> str:
@@ -220,7 +328,7 @@ def _vk_cover(a: dict):
 
 
 async def vk_search(query: str, count: int = 30) -> list:
-    if not VK_TOKEN:
+    if not _vk_enabled():
         return []
     try:
         resp = await _vk_api("audio.search", q=query, count=count, auto_complete=1, sort=2)
