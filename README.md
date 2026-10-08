@@ -36,6 +36,7 @@ YouTube часто блокирует запросы с IP датацентро�
 | `PROXY_URL` | — | прокси для yt-dlp, если YouTube жёстко блокирует регион датацентра |
 | `VK_TOKEN` | — | токен Kate Mobile (vkhost.github.io) — включает поиск и скачивание музыки VK |
 | `VK_COOKIES` | — | cookies.txt с vk.ru/vk.com (вместо VK_TOKEN): бот сам получает веб-токен |
+| `VK_PROXY` | — | http-прокси для запросов к VK (если VK ограничивает зарубежный сервер) |
 | `VK_UA` | Kate Mobile | User-Agent для VK API (менять, только если токен от другого приложения) |
 | `YT_COOKIES` | — | содержимое `cookies.txt` с youtube.com (без него YouTube на Render не качается) |
 

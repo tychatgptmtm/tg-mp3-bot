@@ -168,6 +168,8 @@ VK_UA = os.environ.get("VK_UA", "").strip() or (
     "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; "
     "unknown Android SDK built for x86; en)")
 VK_PREFIX = "vkaudio:"
+# VK_PROXY — http(s)-прокси (лучше российский) для запросов к VK, если VK режет зарубежный сервер
+VK_PROXY = os.environ.get("VK_PROXY", "").strip() or None
 
 # VK_COOKIES — cookies.txt с vk.ru / vk.com из браузера, где выполнен вход.
 # Бот сам получает по ним веб-токен VK (как это делает сайт vk.com) и обновляет его.
@@ -229,7 +231,8 @@ async def _vk_web_token() -> str:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(f"https://login.{base}/?act=web_token", headers=headers,
-                                        data={"version": "1", "app_id": VK_WEB_APP_ID}) as resp:
+                                        data={"version": "1", "app_id": VK_WEB_APP_ID},
+                                        proxy=VK_PROXY) as resp:
                     data = await resp.json(content_type=None)
         except Exception as e:
             last = str(e)[:150]
@@ -260,7 +263,8 @@ async def _vk_call(method: str, token: str, ua: str, params: dict):
     timeout = aiohttp.ClientTimeout(total=20)
     try:
         async with aiohttp.ClientSession(headers={"User-Agent": ua}, timeout=timeout) as session:
-            async with session.post(f"https://api.vk.com/method/{method}", data=params) as resp:
+            async with session.post(f"https://api.vk.com/method/{method}", data=params,
+                                    proxy=VK_PROXY) as resp:
                 return await resp.json(content_type=None)
     except Exception as e:
         log.warning("VK %s: сеть: %s", method, str(e)[:200])
@@ -371,8 +375,17 @@ async def _vk_resolve(url: str) -> dict:
     if not items:
         raise DownloadError("Аудиозапись VK не найдена или удалена 😔")
     a = items[0]
-    if not a.get("url"):
-        raise DownloadError("Эта песня недоступна в VK (ограничение правообладателя или региона) 😔")
+    url_ok = bool(a.get("url")) and "audio_api_unavailable" not in a.get("url", "")
+    log.warning("VK трек %s: url=%s, content_restricted=%s, is_licensed=%s, поля=%s",
+                _vk_full_id(a), ("есть" if url_ok else repr((a.get("url") or "")[:60])),
+                a.get("content_restricted"), a.get("is_licensed"), ",".join(sorted(a.keys()))[:300])
+    if not url_ok:
+        cr = a.get("content_restricted")
+        if cr == 2:
+            raise DownloadError("VK не отдаёт этот трек серверу бота — ограничение по региону 😔")
+        if cr == 5:
+            raise DownloadError("Этот трек ещё не вышел в VK 😔")
+        raise DownloadError("VK не отдал ссылку на трек 😔 (подробности в логах)")
     return a
 
 
@@ -421,7 +434,7 @@ async def process_vk(url: str, preferred_quality: int = 192, progress_cb=None, m
                 cover = None
 
         path = os.path.join(tmp, "track.mp3")
-        args = ["-user_agent", VK_UA,
+        args = (["-http_proxy", VK_PROXY] if VK_PROXY else []) + ["-user_agent", VK_UA,
                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls",
                 "-i", a["url"]]
         if cover:
