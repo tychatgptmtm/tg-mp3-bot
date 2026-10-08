@@ -284,9 +284,27 @@ def _fmt_dur(sec: int) -> str:
     return f"{h}:{mnt:02d}:{s:02d}" if h else f"{mnt}:{s:02d}"
 
 
+SOURCE_ICONS = {"yt": "🟥", "sc": "🟧"}
+SOURCE_NAMES = {"yt": "YouTube", "sc": "SoundCloud", "vk": "VK", "spotify": "Spotify"}
+
+
+def _source_of(url: str) -> str:
+    u = (url or "").lower()
+    if "youtube.com" in u or "youtu.be" in u:
+        return "yt"
+    if "soundcloud.com" in u:
+        return "sc"
+    if "vk.com" in u or "vkvideo.ru" in u or "vk.ru" in u:
+        return "vk"
+    if "spotify" in u:
+        return "spotify"
+    return ""
+
+
 def _item_text(it: dict) -> str:
     name = f"{it['artist']} - {it['title']}" if it["artist"] else it["title"]
-    return f"{_fmt_dur(it['duration'])} {name}"[:60]
+    icon = SOURCE_ICONS.get(it.get("source"), "")
+    return f"{icon} {_fmt_dur(it['duration'])} {name}".strip()[:60]
 
 
 def search_page(sid: str, page: int):
@@ -305,7 +323,7 @@ def search_page(sid: str, page: int):
         if page < pages - 1:
             nav.append(InlineKeyboardButton(text="››", callback_data=f"p:{sid}:{page + 1}"))
         rows.append(nav)
-    text = f"🎶 Аудиозаписи по запросу «<b>{html.escape(data['q'])}</b>»\n<i>Нажми на трек — пришлю MP3</i>"
+    text = f"🎶 Аудиозаписи по запросу «<b>{html.escape(data['q'])}</b>»\n<i>Нажми на трек — пришлю MP3</i>\n🟥 YouTube · 🟧 SoundCloud"
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -344,7 +362,10 @@ async def deliver(m: Message, user_id: int, url: str, meta: dict = None) -> None
         result = await process_url(url, quality, progress_cb=progress, loop=loop, meta=meta)
         await _safe_edit(status, "🎛 <i>Конвертирую в MP3 и вшиваю теги с обложкой…</i>")
 
-        caption = f"🎚 {result['quality']} kbps · {result['size_mb']} МБ" + await _caption_footer(m.bot)
+        src = SOURCE_NAMES.get(_source_of(result.get("source_url") or url), "")
+        caption = (f"🎚 {result['quality']} kbps · {result['size_mb']} МБ"
+                   + (f"\n📡 Найдено: {src}" if src else "")
+                   + await _caption_footer(m.bot))
         await m.answer_audio(
             FSInputFile(result["path"]),
             title=(result["title"] or "audio")[:64],
