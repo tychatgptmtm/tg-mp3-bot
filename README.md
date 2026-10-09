@@ -1,13 +1,13 @@
 # 🎧 MP3 Downloader Bot
 
-Telegram-бот: отправляешь ссылку на трек или видео — получаешь готовый **MP3** с обложкой и тегами.
+Telegram-бот: отправляешь ссылку на трек или видео — получаешь готовый **MP3** с обложкой и тегами, а по кнопке — текст песни с Genius.
 
 ## Возможности
 
 - **YouTube / YouTube Music** — напрямую + обход блокировки датацентров
-- **VK Видео** (vk.com/video, vkvideo.ru) — напрямую
 - **SoundCloud** — напрямую
 - **Spotify** — трек находится по метаданным (поиск на YouTube, запасной поиск на SoundCloud)
+- **Тексты песен с Genius** — кнопка «📝 Текст» под каждым треком или `/lyrics исполнитель — название` (если Genius недоступен — запасной источник LRCLIB)
 - **Поиск по названию** — просто напиши «исполнитель — название», бот найдёт трек на SoundCloud / YouTube
 - Любые другие сайты, поддерживаемые [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - Красивое меню на inline-кнопках, прогресс скачивания, выбор качества (128 / 192 / 320 kbps)
@@ -34,10 +34,8 @@ YouTube часто блокирует запросы с IP датацентро�
 | `DB_PATH` | — | путь к SQLite (по умолчанию `data/bot.db`) |
 | `PORT` | — | порт health-check сервера (Render выставляет сам) |
 | `PROXY_URL` | — | прокси для yt-dlp, если YouTube жёстко блокирует регион датацентра |
-| `VK_TOKEN` | — | токен Kate Mobile (vkhost.github.io) — включает поиск и скачивание музыки VK |
-| `VK_COOKIES` | — | cookies.txt с vk.ru/vk.com (вместо VK_TOKEN): бот сам получает веб-токен |
-| `VK_PROXY` | — | http-прокси для запросов к VK (если VK ограничивает зарубежный сервер) |
-| `VK_UA` | Kate Mobile | User-Agent для VK API (менять, только если токен от другого приложения) |
+| `GENIUS_TOKEN` | — | Client Access Token с [genius.com/api-clients](https://genius.com/api-clients) — без него Genius с серверных IP часто отвечает 403 |
+| `GENIUS_PROXY` | — | прокси для genius.com (по умолчанию берётся `PROXY_URL`) |
 | `YT_COOKIES` | — | содержимое `cookies.txt` с youtube.com (без него YouTube на Render не качается) |
 
 ## Локальный запуск
@@ -76,7 +74,8 @@ BOT_TOKEN=123:ABC ADMIN_IDS=123456789 python bot.py
 ## Структура
 
 ```
-bot.py         — логика бота (aiogram 3): меню, ссылки, админка, health-check, self-update yt-dlp
+bot.py         — логика бота (aiogram 3): меню, ссылки, тексты, админка, health-check
+lyrics.py      — тексты песен: Genius + запасной LRCLIB
 downloader.py  — yt-dlp + FFmpeg: поиск, ротация клиентов YouTube, Piped-фолбэк, конвертация в MP3
 database.py    — SQLite: пользователи, качество, баны, статистика
 Dockerfile     — образ с FFmpeg для Render

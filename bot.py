@@ -1,6 +1,6 @@
 """
 MP3 Downloader Bot 🎧
-Telegram-бот: пришлите ссылку (VK / YouTube / Spotify / SoundCloud) — получите MP3.
+Telegram-бот: пришлите ссылку (YouTube / Spotify / SoundCloud) — получите MP3 и текст песни.
 
 Переменные окружения:
   BOT_TOKEN  — токен от @BotFather (обязателен)
@@ -8,6 +8,7 @@ Telegram-бот: пришлите ссылку (VK / YouTube / Spotify / SoundCl
   DB_PATH    — путь к базе SQLite (по умолчанию data/bot.db)
   PORT       — порт health-check сервера (по умолчанию 10000)
   PROXY_URL  — опционально: прокси для исходящих запросов yt-dlp
+  GENIUS_TOKEN — опционально: токен Genius API для текстов песен
 """
 import asyncio
 import html
@@ -36,6 +37,7 @@ from aiogram.types import (
 
 from database import db
 from downloader import DownloadError, URL_RE, process_url, search_tracks
+from lyrics import LyricsError, clean_query, find_lyrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
 log = logging.getLogger("bot")
@@ -61,10 +63,10 @@ WELCOME_TPL = (
     "Привет, <b>{name}</b>! Я превращаю ссылки в готовые MP3-файлы.\n\n"
     "<b>Откуда умею качать:</b>\n"
     "• YouTube / YouTube Music\n"
-    "• Музыка VK и VK Видео\n"
     "• SoundCloud\n"
     "• Spotify (нахожу и качаю лучшую версию трека)\n"
-    "• Поиск по названию 🔎\n\n"
+    "• Поиск по названию 🔎\n"
+    "• Тексты песен с Genius 📝\n\n"
     "Пришли ссылку — или просто напиши <i>исполнитель — название</i>, найду сам 🔎\n"
     "🎚 Текущее качество: <b>{q} kbps</b>"
 )
@@ -73,13 +75,14 @@ HELP_TEXT = (
     "📥 <b>Как скачать</b>\n\n"
     "1️⃣ Скопируй ссылку на трек или видео:\n"
     "• youtube.com, youtu.be, music.youtube.com\n"
-    "• vk.com/audio…, посты VK с музыкой, vkvideo.ru\n"
     "• soundcloud.com\n"
     "• open.spotify.com/track/…\n\n"
     "2️⃣ Отправь ссылку мне сообщением\n"
     "   …или просто напиши <i>исполнитель — название</i> (например: tryavoid криминальное чтиво 2) — "
     "пришлю список, выбери нужный трек\n"
-    "3️⃣ Через несколько секунд получишь MP3 с обложкой и тегами 🎵\n\n"
+    "3️⃣ Через несколько секунд получишь MP3 с обложкой и тегами 🎵\n"
+    "4️⃣ Нажми «📝 Текст» под треком — пришлю слова песни с Genius\n"
+    "   …или напиши /lyrics <i>исполнитель — название</i>\n\n"
     "⚠️ Лимит Telegram — 50 МБ на файл. Для длинных видео качество "
     "автоматически понижается, чтобы файл влез.\n"
     "⚠️ Для ссылок на плейлисты качаю первый трек.\n"
@@ -92,6 +95,7 @@ ABOUT_TEXT = (
     "MP3 Downloader скачивает аудио и видео из интернета и отдаёт "
     "готовый MP3 с обложкой и тегами исполнителя.\n\n"
     "⚙️ Движок: yt-dlp + FFmpeg\n"
+    "📝 Тексты: Genius (запасной — LRCLIB)\n"
     "🤖 Каркас: aiogram 3\n"
     "🔒 Без регистрации и лишних данных — только ссылка и файл."
 )
@@ -284,20 +288,16 @@ def _fmt_dur(sec: int) -> str:
     return f"{h}:{mnt:02d}:{s:02d}" if h else f"{mnt}:{s:02d}"
 
 
-SOURCE_ICONS = {"vk": "🟦", "yt": "🟥", "sc": "🟧"}
-SOURCE_NAMES = {"yt": "YouTube", "sc": "SoundCloud", "vk": "VK", "spotify": "Spotify"}
+SOURCE_ICONS = {"yt": "🟥", "sc": "🟧"}
+SOURCE_NAMES = {"yt": "YouTube", "sc": "SoundCloud", "spotify": "Spotify"}
 
 
 def _source_of(url: str) -> str:
     u = (url or "").lower()
-    if u.startswith("vkaudio:"):
-        return "vk"
     if "youtube.com" in u or "youtu.be" in u:
         return "yt"
     if "soundcloud.com" in u:
         return "sc"
-    if "vk.com" in u or "vkvideo.ru" in u or "vk.ru" in u:
-        return "vk"
     if "spotify" in u:
         return "spotify"
     return ""
@@ -326,7 +326,7 @@ def search_page(sid: str, page: int):
             nav.append(InlineKeyboardButton(text="››", callback_data=f"p:{sid}:{page + 1}"))
         rows.append(nav)
     used = {it.get("source") for it in items}
-    legend = " · ".join(f"{SOURCE_ICONS[k]} {SOURCE_NAMES[k]}" for k in ("vk", "yt", "sc") if k in used)
+    legend = " · ".join(f"{SOURCE_ICONS[k]} {SOURCE_NAMES[k]}" for k in ("yt", "sc") if k in used)
     text = (f"🎶 Аудиозаписи по запросу «<b>{html.escape(data['q'])}</b>»\n"
             f"<i>Нажми на трек — пришлю MP3</i>\n{legend}")
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -343,6 +343,93 @@ async def _caption_footer(bot: Bot) -> str:
             return ""
     u = _bot_username["v"]
     return f'\n🔎 <a href="https://t.me/{u}">Найти другую песню</a>' if u else ""
+
+
+# ------------------------------------------------------------------ тексты песен
+
+LYRICS_MAX = 2000
+_lyrics_q: dict = {}              # lid -> поисковый запрос для текста
+_lid_counter = {"n": 0}
+TG_LIMIT = 4000
+
+
+def lyrics_kb(artist: str, title: str):
+    q = clean_query(artist, title)
+    if len(q) < 2:
+        return None
+    _lid_counter["n"] += 1
+    lid = format(_lid_counter["n"], "x")
+    _lyrics_q[lid] = q
+    while len(_lyrics_q) > LYRICS_MAX:
+        _lyrics_q.pop(next(iter(_lyrics_q)))
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Текст", callback_data=f"ly:{lid}")]])
+
+
+def _split_text(text: str, limit: int = TG_LIMIT) -> list:
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def send_lyrics(m: Message, query: str) -> None:
+    status = await m.answer("📝 <i>Ищу текст…</i>")
+    try:
+        r = await find_lyrics(query)
+    except LyricsError as e:
+        msg = f"❌ {html.escape(str(e.args[0]))}"
+        if len(e.args) > 1 and e.args[1]:
+            msg += f'\n🔗 <a href="{html.escape(e.args[1])}">Открыть на Genius</a>'
+        await _safe_edit(status, msg)
+        return
+    except Exception:
+        log.exception("Ошибка поиска текста %s", query)
+        await _safe_edit(status, "❌ Поиск текстов сейчас не работает, попробуй позже.")
+        return
+    head = f"📝 <b>{html.escape(r['artist'])} — {html.escape(r['title'])}</b>\n\n"
+    foot = f"\n\n🔗 <a href=\"{html.escape(r['url'])}\">Genius</a>" if r.get("url") else ""
+    if r["source"] != "Genius":
+        foot += f"\n<i>Источник: {html.escape(r['source'])}</i>"
+    parts = _split_text(html.escape(r["text"]), TG_LIMIT - len(head) - len(foot))
+    await status.delete()
+    for i, part in enumerate(parts):
+        await m.answer((head if i == 0 else "") + part + (foot if i == len(parts) - 1 else ""),
+                       disable_web_page_preview=True)
+
+
+@router.message(Command("lyrics", "text"))
+async def cmd_lyrics(m: Message, command: CommandObject):
+    if m.from_user is None or db.is_banned(m.from_user.id):
+        return
+    q = (command.args or "").strip()
+    if not q:
+        await m.answer("📝 Напиши так: /lyrics <i>исполнитель — название</i>\n"
+                       "или нажми «📝 Текст» под скачанным треком.")
+        return
+    await send_lyrics(m, q)
+
+
+@router.callback_query(F.data.startswith("ly:"))
+async def cb_lyrics(c: CallbackQuery):
+    if c.from_user is None or c.message is None or db.is_banned(c.from_user.id):
+        return await c.answer()
+    q = _lyrics_q.get((c.data or "").split(":", 1)[1])
+    if not q:
+        return await c.answer("Кнопка устарела — напиши /lyrics исполнитель — название", show_alert=True)
+    await c.answer("📝 Ищу текст…")
+    await send_lyrics(c.message, q)
 
 
 async def deliver(m: Message, user_id: int, url: str, meta: dict = None) -> None:
@@ -377,6 +464,7 @@ async def deliver(m: Message, user_id: int, url: str, meta: dict = None) -> None
             performer=(result["performer"] or None),
             duration=result["duration"],
             caption=caption,
+            reply_markup=lyrics_kb(result["performer"] or "", result["title"] or ""),
         )
         db.add_download(user_id)
         await status.delete()
@@ -408,6 +496,10 @@ async def on_any_text(m: Message):
     db.add_user(m.from_user)
 
     url_match = URL_RE.search(text)
+    if url_match and re.search(r"(^|[/.])(vk\.com|vk\.ru|vkvideo\.ru)", url_match.group(0), re.I):
+        await m.reply("😔 VK больше не поддерживается. Пришли ссылку на YouTube, SoundCloud или Spotify "
+                      "— или просто напиши исполнителя и название.")
+        return
     if url_match:
         await deliver(m, m.from_user.id, url_match.group(0).rstrip(").,;"))
         return
@@ -536,6 +628,7 @@ async def set_commands(bot: Bot) -> None:
     base = [
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="help", description="📥 Как скачать"),
+        BotCommand(command="lyrics", description="📝 Текст песни"),
         BotCommand(command="quality", description="⚙️ Качество звука"),
     ]
     await bot.set_my_commands(base)

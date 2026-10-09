@@ -11,5 +11,7 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      - key: GENIUS_TOKEN
+        sync: false
       - key: DB_PATH
         value: /tmp/bot.db

@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py downloader.py database.py ./
+COPY bot.py downloader.py database.py lyrics.py ./
 
 # База SQLite и временные файлы
 ENV DB_PATH=/tmp/bot.db
