@@ -32,11 +32,13 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from database import db
-from downloader import DownloadError, URL_RE, process_url, search_tracks
+from downloader import DownloadError, URL_RE, process_url, search_tracks, track_name_from_url
 from lyrics import LyricsError, clean_query, find_lyrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
@@ -82,7 +84,7 @@ HELP_TEXT = (
     "пришлю список, выбери нужный трек\n"
     "3️⃣ Через несколько секунд получишь MP3 с обложкой и тегами 🎵\n"
     "4️⃣ Нажми «📝 Текст» под треком — пришлю слова песни с Genius\n"
-    "   …или напиши /lyrics <i>исполнитель — название</i>\n\n"
+    "   …или нажми кнопку «📝 Текст песни» внизу и пришли название или ссылку\n\n"
     "⚠️ Лимит Telegram — 50 МБ на файл. Для длинных видео качество "
     "автоматически понижается, чтобы файл влез.\n"
     "⚠️ Для ссылок на плейлисты качаю первый трек.\n"
@@ -113,10 +115,23 @@ ADMIN_HELP = (
 
 def main_menu(quality: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Текст песни", callback_data="lyrics_ask")],
         [InlineKeyboardButton(text="📥 Как скачать", callback_data="help")],
         [InlineKeyboardButton(text=f"⚙️ Качество: {quality} kbps", callback_data="settings")],
         [InlineKeyboardButton(text="ℹ️ О боте", callback_data="about")],
     ])
+
+
+LYRICS_BTN = "📝 Текст песни"
+reply_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=LYRICS_BTN)]],
+                               resize_keyboard=True, is_persistent=True,
+                               input_field_placeholder="Ссылка или исполнитель — название")
+CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="lyrics_cancel")]])
+LYRICS_ASK_TEXT = ("📝 <b>Текст песни</b>\n\n"
+                   "Напиши <i>исполнитель — название</i> или пришли ссылку на трек "
+                   "(YouTube, SoundCloud, Spotify) — найду слова на Genius.")
+_await_lyrics: dict = {}          # user_id -> время, когда бот попросил название
+AWAIT_TTL = 10 * 60
 
 
 def quality_menu(current: int) -> InlineKeyboardMarkup:
@@ -175,6 +190,7 @@ async def cmd_start(m: Message):
     user = db.get_user(m.from_user.id) or {}
     q = user.get("quality", 192)
     name = html.escape(m.from_user.first_name or "друг")
+    await m.answer("👇 Кнопка «📝 Текст песни» теперь всегда внизу", reply_markup=reply_kb)
     await m.answer(WELCOME_TPL.format(name=name, q=q), reply_markup=main_menu(q))
 
 
@@ -415,10 +431,62 @@ async def cmd_lyrics(m: Message, command: CommandObject):
         return
     q = (command.args or "").strip()
     if not q:
-        await m.answer("📝 Напиши так: /lyrics <i>исполнитель — название</i>\n"
-                       "или нажми «📝 Текст» под скачанным треком.")
+        await ask_lyrics(m, m.from_user.id)
         return
-    await send_lyrics(m, q)
+    await lyrics_from_input(m, q)
+
+
+async def ask_lyrics(m: Message, user_id: int) -> None:
+    _await_lyrics[user_id] = time.time()
+    await m.answer(LYRICS_ASK_TEXT, reply_markup=CANCEL_KB)
+
+
+async def lyrics_from_input(m: Message, text: str) -> None:
+    """Текст пользователя (название или ссылка) → текст песни."""
+    url_match = URL_RE.search(text)
+    if url_match:
+        status = await m.answer("🔗 <i>Смотрю, что за трек…</i>")
+        try:
+            query = await track_name_from_url(url_match.group(0).rstrip(").,;"))
+        except DownloadError as e:
+            await _safe_edit(status, f"❌ {e}")
+            return
+        except Exception:
+            log.exception("Не удалось определить трек по ссылке %s", text)
+            await _safe_edit(status, "❌ Не смог понять трек по ссылке 😕 Напиши исполнителя и название.")
+            return
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await send_lyrics(m, clean_query("", query) or query)
+        return
+    await send_lyrics(m, re.sub(r"\s+", " ", text)[:150])
+
+
+@router.message(F.text == LYRICS_BTN)
+async def on_lyrics_button(m: Message):
+    if m.from_user is None or db.is_banned(m.from_user.id):
+        return
+    db.add_user(m.from_user)
+    await ask_lyrics(m, m.from_user.id)
+
+
+@router.callback_query(F.data == "lyrics_ask")
+async def cb_lyrics_ask(c: CallbackQuery):
+    if c.from_user is None or c.message is None or db.is_banned(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await ask_lyrics(c.message, c.from_user.id)
+
+
+@router.callback_query(F.data == "lyrics_cancel")
+async def cb_lyrics_cancel(c: CallbackQuery):
+    if c.from_user is not None:
+        _await_lyrics.pop(c.from_user.id, None)
+    if c.message is not None:
+        await _safe_edit(c.message, "✖️ Отменено. Можешь прислать ссылку или название — скачаю MP3 🎧")
+    await c.answer()
 
 
 @router.callback_query(F.data.startswith("ly:"))
@@ -494,6 +562,11 @@ async def on_any_text(m: Message):
     if db.is_banned(m.from_user.id):
         return
     db.add_user(m.from_user)
+
+    asked = _await_lyrics.pop(m.from_user.id, None)
+    if asked and time.time() - asked < AWAIT_TTL:
+        await lyrics_from_input(m, text)
+        return
 
     url_match = URL_RE.search(text)
     if url_match and re.search(r"(^|[/.])(vk\.com|vk\.ru|vkvideo\.ru)", url_match.group(0), re.I):

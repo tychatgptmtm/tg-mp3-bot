@@ -488,3 +488,45 @@ async def process_url(url: str, preferred_quality: int = 192, progress_cb=None, 
         "quality": quality,
         "size_mb": round(size_mb, 1),
     }
+
+
+# ------------------------------------------------------------------ название трека по ссылке (для текстов)
+
+_OEMBED = {
+    "youtube": "https://www.youtube.com/oembed",
+    "soundcloud": "https://soundcloud.com/oembed",
+}
+
+
+async def track_name_from_url(url: str) -> str:
+    """Ссылка YouTube / SoundCloud / Spotify / др. → строка «исполнитель название» для поиска текста."""
+    if is_spotify(url):
+        return await resolve_spotify(url)
+    kind = "youtube" if YOUTUBE_RE.search(url) else ("soundcloud" if "soundcloud.com" in url.lower() else None)
+    if kind:
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout,
+                                             headers={"User-Agent": "Mozilla/5.0"}) as session:
+                async with session.get(_OEMBED[kind], params={"url": url, "format": "json"}) as r:
+                    if r.status == 200:
+                        d = await r.json(content_type=None)
+                        title = (d.get("title") or "").strip()
+                        author = _clean_name(d.get("author_name") or "")
+                        if title:
+                            if _SEP_RE.search(title) or (author and author.lower() in title.lower()):
+                                return title
+                            return f"{author} {title}".strip()
+        except Exception as e:
+            log.info("oembed %s: %s", url[:60], str(e)[:120])
+    try:
+        info, _ = await _probe_with_fallback(url)
+    except Exception as e:
+        raise DownloadError(_friendly_error(e))
+    if info.get("entries"):
+        info = next((e for e in info["entries"] if e), {}) or {}
+    title = info.get("track") or info.get("title") or ""
+    artist = info.get("artist") or _clean_name(info.get("uploader") or info.get("channel") or "")
+    if not title:
+        raise DownloadError("Не смог понять, что за трек по этой ссылке 😕 Напиши название.")
+    return title if _SEP_RE.search(title) else f"{artist} {title}".strip()
