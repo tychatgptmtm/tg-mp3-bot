@@ -5,10 +5,15 @@
   GENIUS_TOKEN  — Client Access Token с https://genius.com/api-clients (рекомендуется:
                   без него поиск Genius с серверных IP часто блокируется)
   GENIUS_PROXY  — опционально: прокси для запросов к genius.com (иначе берётся PROXY_URL)
+  GENIUS_MIRRORS — опционально: зеркала Genius через запятую (dumb / intellectual)
+
+Genius блокирует IP датацентров (Render и т.п.) — тогда тексты Genius берутся через
+открытые зеркала-фронтенды (dumb, intellectual), которые отдают те же страницы Genius.
 """
 import logging
 import os
 import re
+import time
 from html import unescape
 from html.parser import HTMLParser
 
@@ -21,7 +26,13 @@ GENIUS_PROXY = (os.environ.get("GENIUS_PROXY", "").strip()
                 or os.environ.get("PROXY_URL", "").strip() or None)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-_TIMEOUT = aiohttp.ClientTimeout(total=20)
+_TIMEOUT = aiohttp.ClientTimeout(total=12)
+GENIUS_MIRRORS = [m.strip().rstrip("/") for m in (
+    os.environ.get("GENIUS_MIRRORS", "").strip()
+    or "https://dumb.bloat.cat,https://dumb.canine.tools,https://genius.fsky.io,"
+       "https://dumb.artemislena.eu,https://intellectual.insprill.net"
+).split(",") if m.strip()]
+_genius_blocked = {"until": 0.0}   # genius.com отвечает 403 — не дёргаем его какое-то время
 
 
 class LyricsError(Exception):
@@ -135,6 +146,107 @@ async def _genius_lyrics(session: aiohttp.ClientSession, url: str) -> str:
     return _parse_genius_page(page)
 
 
+# ------------------------------------------------------------------ зеркала Genius
+
+_DUMB_ITEM_RE = re.compile(
+    r'<a id="search-item" href="(/[^"?#]+-lyrics)"><img[^>]*><div><span>(.*?)</span><h3>(.*?)</h3>', re.S)
+_INTEL_ITEM_RE = re.compile(r'href="(/[^"?#]+-lyrics)\?id=\d+"')
+
+
+def _strip_tags(s: str) -> str:
+    return unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
+
+
+async def _mirror_search(session: aiohttp.ClientSession, query: str):
+    """Ищет песню на зеркалах. Возвращает список путей вида /Artist-song-lyrics."""
+    fallback = []
+    for base in GENIUS_MIRRORS:
+        try:
+            async with session.get(f"{base}/search", params={"q": query}) as r:
+                if r.status != 200:
+                    log.info("mirror %s: search %s", base, r.status)
+                    continue
+                page = await r.text()
+        except Exception as e:
+            log.info("mirror %s: %s", base, str(e)[:120])
+            continue
+        paths = [m.group(1) for m in _DUMB_ITEM_RE.finditer(page)]
+        paths += [p for p in _INTEL_ITEM_RE.findall(page) if p not in paths]
+        # переводы/романизации («Genius Romanizations», «Genius Translations») — в конец
+        own = [p for p in paths if not p.lower().startswith("/genius-")]
+        if own:
+            return own + [p for p in paths if p not in own]
+        if paths:
+            fallback = fallback or paths
+    return fallback
+
+
+class _DumbParser(HTMLParser):
+    """Страница dumb: <div id="lyrics">…</div>, артист в <h2>, название в <h1> внутри #metadata-info."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.parts = []
+        self.meta = None
+        self.title = ""
+        self.artist = ""
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if self.depth:
+            if tag == "br":
+                self.parts.append("\n")
+            elif tag not in ("img", "hr"):
+                self.depth += 1
+            return
+        if tag == "div" and a.get("id") == "lyrics":
+            self.depth = 1
+        elif tag in ("h1", "h2") and not (self.title if tag == "h1" else self.artist):
+            self.meta = tag
+
+    def handle_endtag(self, tag):
+        if self.depth and tag not in ("br", "img", "hr"):
+            self.depth -= 1
+        if tag == self.meta:
+            self.meta = None
+
+    def handle_data(self, data):
+        if self.depth:
+            self.parts.append(data)
+        elif self.meta == "h1":
+            self.title += data
+        elif self.meta == "h2":
+            self.artist += data
+
+
+def _parse_dumb(page: str):
+    p = _DumbParser()
+    p.feed(page)
+    text = re.sub(r"[ \t]+\n", "\n", "".join(p.parts))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return p.artist.strip(), p.title.strip(), text
+
+
+async def _mirror_lyrics(session: aiohttp.ClientSession, path: str):
+    for base in GENIUS_MIRRORS:
+        if "intellectual" in base:
+            continue
+        try:
+            async with session.get(base + path) as r:
+                if r.status != 200:
+                    log.info("mirror %s%s: %s", base, path, r.status)
+                    continue
+                page = await r.text()
+        except Exception as e:
+            log.info("mirror %s: %s", base, str(e)[:120])
+            continue
+        artist, title, text = _parse_dumb(page)
+        if text:
+            return artist, title, text
+    return None
+
+
 # ------------------------------------------------------------------ LRCLIB (запасной)
 
 async def _lrclib(session: aiohttp.ClientSession, query: str):
@@ -162,20 +274,42 @@ async def find_lyrics(query: str) -> dict:
 
     genius_url, title, artist = None, "", ""
     async with aiohttp.ClientSession(timeout=_TIMEOUT, headers={"User-Agent": UA}) as session:
-        try:
-            hits = await _genius_search(session, query)
-            if hits:
-                # предпочитаем хит, у которого исполнитель встречается в запросе
-                qn = _norm(query)
-                best = next((h for h in hits if _norm(h["artist"]) and _norm(h["artist"]) in qn), hits[0])
-                genius_url, title, artist = best["url"], best["title"], best["artist"]
-                text = await _genius_lyrics(session, genius_url)
-                if text:
-                    return {"title": title, "artist": artist, "text": text,
-                            "url": genius_url, "source": "Genius"}
-        except Exception as e:
-            log.warning("Genius: %s", str(e)[:200])
+        # 1) напрямую через Genius (работает с токеном / прокси / не с датацентра)
+        direct = GENIUS_TOKEN or GENIUS_PROXY or time.time() > _genius_blocked["until"]
+        if direct:
+            try:
+                hits = await _genius_search(session, query)
+                if hits:
+                    qn = _norm(query)
+                    best = next((h for h in hits if _norm(h["artist"]) and _norm(h["artist"]) in qn), hits[0])
+                    genius_url, title, artist = best["url"], best["title"], best["artist"]
+                    text = await _genius_lyrics(session, genius_url)
+                    if text:
+                        return {"title": title, "artist": artist, "text": text,
+                                "url": genius_url, "source": "Genius"}
+            except Exception as e:
+                log.warning("Genius напрямую: %s", str(e)[:200])
+                if "403" in str(e):
+                    _genius_blocked["until"] = time.time() + 6 * 3600
 
+        # 2) Genius через зеркала
+        try:
+            if genius_url:
+                paths = ["/" + genius_url.split("genius.com/", 1)[-1].lstrip("/")]
+            else:
+                paths = await _mirror_search(session, query)
+            for path in paths[:2]:
+                got = await _mirror_lyrics(session, path)
+                if got:
+                    a, t, text = got
+                    return {"title": t or title, "artist": a or artist, "text": text,
+                            "url": "https://genius.com" + path, "source": "Genius"}
+            if paths and not genius_url:
+                genius_url = "https://genius.com" + paths[0]
+        except Exception as e:
+            log.warning("Genius через зеркала: %s", str(e)[:200])
+
+        # 3) запасной источник
         try:
             lr = await _lrclib(session, f"{artist} {title}".strip() if title else query)
             if not lr and title:

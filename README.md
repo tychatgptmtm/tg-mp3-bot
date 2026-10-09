@@ -7,7 +7,7 @@ Telegram-бот: отправляешь ссылку на трек или вид
 - **YouTube / YouTube Music** — напрямую + обход блокировки датацентров
 - **SoundCloud** — напрямую
 - **Spotify** — трек находится по метаданным (поиск на YouTube, запасной поиск на SoundCloud)
-- **Тексты песен с Genius** — кнопка «📝 Текст» под каждым треком или `/lyrics исполнитель — название` (если Genius недоступен — запасной источник LRCLIB)
+- **Тексты песен с Genius** — кнопка «📝 Текст» под каждым треком или `/lyrics исполнитель — название` (Genius блокирует IP хостингов, поэтому бот сам берёт тексты Genius через открытые зеркала dumb / intellectual; если и они не ответят — запасной источник LRCLIB)
 - **Поиск по названию** — просто напиши «исполнитель — название», бот найдёт трек на SoundCloud / YouTube
 - Любые другие сайты, поддерживаемые [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - Красивое меню на inline-кнопках, прогресс скачивания, выбор качества (128 / 192 / 320 kbps)
@@ -34,7 +34,8 @@ YouTube часто блокирует запросы с IP датацентро�
 | `DB_PATH` | — | путь к SQLite (по умолчанию `data/bot.db`) |
 | `PORT` | — | порт health-check сервера (Render выставляет сам) |
 | `PROXY_URL` | — | прокси для yt-dlp, если YouTube жёстко блокирует регион датацентра |
-| `GENIUS_TOKEN` | — | Client Access Token с [genius.com/api-clients](https://genius.com/api-clients) — без него Genius с серверных IP часто отвечает 403 |
+| `GENIUS_TOKEN` | — | Client Access Token с [genius.com/api-clients](https://genius.com/api-clients) — необязательно: без него тексты идут через зеркала |
+| `GENIUS_MIRRORS` | — | свои зеркала Genius через запятую (по умолчанию уже прописаны рабочие) |
 | `GENIUS_PROXY` | — | прокси для genius.com (по умолчанию берётся `PROXY_URL`) |
 | `YT_COOKIES` | — | содержимое `cookies.txt` с youtube.com (без него YouTube на Render не качается) |
 
