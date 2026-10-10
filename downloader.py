@@ -280,12 +280,16 @@ def _make_hook(loop, cb, title: str):
             p = float(raw)
         except ValueError:
             return
-        if p - state["last"] < 15:
+        if p - state["last"] < 10:
             return
         state["last"] = p
+        filled = max(0, min(10, int(p // 10)))
+        bar = "▰" * filled + "▱" * (10 - filled)
+        speed = re.sub(r"\x1b\[[0-9;]*m", "", str(d.get("_speed_str", ""))).strip()
+        extra = f" · {speed}" if speed and "unknown" not in speed.lower() else ""
         try:
             asyncio.run_coroutine_threadsafe(
-                cb(f"⬇️ <i>Скачиваю «{title}» — {int(p)}%</i>"), loop
+                cb(f"⬇️ <b>Скачиваю</b>\n<i>{title}</i>\n\n<code>{bar}</code> {int(p)}%{extra}"), loop
             )
         except Exception:
             pass
