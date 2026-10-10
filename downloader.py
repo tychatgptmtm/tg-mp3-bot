@@ -83,15 +83,12 @@ COOKIES_FILE = _prepare_cookies()
 FALLBACK_QUALITIES = [320, 256, 192, 128, 96, 64]
 _executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ytdl")
 
-YT_CLIENT_SETS = [
-    None,
-    ["android"],
-    ["tv"],
-    ["ios"],
-    ["web_safari"],
-    ["web_embedded"],
-    ["mweb"],
-]
+# Наборы клиентов YouTube. android/ios не принимают cookies и почти всегда
+# требуют PO-токен, поэтому с cookies используем только «веб/ТВ»-клиенты.
+if COOKIES_FILE:
+    YT_CLIENT_SETS = [None, ["tv"], ["web_safari"], ["mweb"], ["tv_downgraded"], ["web"]]
+else:
+    YT_CLIENT_SETS = [None, ["tv_simply"], ["android_vr"], ["web_embedded"], ["tv"], ["mweb"]]
 
 YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.I)
 
@@ -103,6 +100,8 @@ RETRY_MARKERS = (
     "http error 403", "http error 429", "http error 400",
     "no video formats", "requested format", "player response",
     "timeout", "timed out", "premiere", "live event",
+    "http error 401", "unable to download api page", "only images are available",
+    "fragment", "unable to extract", "did not get any data",
 )
 
 
@@ -189,6 +188,10 @@ def _base_opts() -> dict:
         "noplaylist": True,
         "socket_timeout": 25,
         "nocheckcertificate": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        # JS-рантайм для YouTube (решение n/sig-челленджей). Deno ставится в Dockerfile.
+        "js_runtimes": {"deno": {}, "node": {}},
     }
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
@@ -305,7 +308,9 @@ def _friendly_error(exc: Exception) -> str:
         return "Контент приватный, скачать не получится 😔"
     if "age" in msg and ("confirm" in msg or "restrict" in msg):
         return "Возрастное ограничение — скачивание недоступно 😔"
-    if "sign in" in msg or "login" in msg or "cookies" in msg or "not a bot" in msg:
+    if ("sign in" in msg or "login" in msg or "cookies" in msg or "not a bot" in msg
+            or "http error 403" in msg or "requested format" in msg
+            or "only images are available" in msg):
         return ("YouTube блокирует сервер бота 😔 Пришли трек ссылкой на SoundCloud или Spotify."
                 if not COOKIES_FILE else
                 "YouTube не принял cookies — их нужно обновить 😔")
@@ -401,16 +406,66 @@ async def process_query(query: str, preferred_quality: int = 192, progress_cb=No
     return await process_url("", preferred_quality, progress_cb, loop, search_query=query)
 
 
+async def _youtube_fallback_query(url: str, meta: dict = None):
+    """Строка поиска для запасного скачивания с SoundCloud, если YouTube не отдал трек."""
+    if meta and meta.get("title"):
+        return f"{meta.get('artist') or ''} {meta['title']}".strip()
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout,
+                                         headers={"User-Agent": "Mozilla/5.0"}) as session:
+            async with session.get(_OEMBED["youtube"], params={"url": url, "format": "json"}) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json(content_type=None)
+    except Exception as e:
+        log.info("oembed fallback %s: %s", url[:60], str(e)[:120])
+        return None
+    title = (d.get("title") or "").strip()
+    author = _clean_name(d.get("author_name") or "")
+    if not title:
+        return None
+    if _SEP_RE.search(title) or (author and author.lower() in title.lower()):
+        return title
+    return f"{author} {title}".strip()
+
+
 async def process_url(url: str, preferred_quality: int = 192, progress_cb=None, loop=None,
                       search_query: str = None, meta: dict = None):
     """
     Возвращает dict: path, tmpdir, title, performer, duration, quality, size_mb.
     Вызывающий обязан удалить tmpdir после отправки!
+    Если YouTube не отдаёт трек (блок сервера, нет cookies и т.п.) — ищем
+    тот же трек на SoundCloud и качаем оттуда.
     """
+    try:
+        return await _process_url(url, preferred_quality, progress_cb, loop, search_query, meta)
+    except DownloadError as e:
+        if search_query or not url or is_spotify(url) or not YOUTUBE_RE.search(url):
+            raise
+        query = await _youtube_fallback_query(url, meta)
+        if not query:
+            raise
+        log.warning("YouTube не отдал %s (%s) — пробую SoundCloud: %s", url[:80], str(e)[:80], query)
+        if progress_cb:
+            try:
+                await progress_cb("🔁 <i>YouTube не отдаёт трек, ищу его на SoundCloud…</i>")
+            except Exception:
+                pass
+        try:
+            return await _process_url("", preferred_quality, progress_cb, loop,
+                                      search_query=query, meta=meta, sources=("sc",))
+        except DownloadError:
+            raise e
+
+
+async def _process_url(url: str, preferred_quality: int = 192, progress_cb=None, loop=None,
+                       search_query: str = None, meta: dict = None, sources=("sc", "yt")):
     loop = loop or asyncio.get_running_loop()
+    prefixes = {"sc": "scsearch1:", "yt": "ytsearch1:"}
 
     if search_query:
-        candidates = [f"scsearch1:{search_query}", f"ytsearch1:{search_query}"]
+        candidates = [f"{prefixes[s]}{search_query}" for s in sources]
     elif is_spotify(url):
         query = await resolve_spotify(url)
         log.info("spotify -> %s", query)

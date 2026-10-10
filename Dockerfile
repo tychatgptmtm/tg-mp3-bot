@@ -11,6 +11,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# YouTube часто ломает старые версии yt-dlp. ADD скачивает инфо о последнем релизе
+# с PyPI: когда выходит новая версия, кэш слоя сбрасывается и yt-dlp обновляется.
+ADD https://pypi.org/pypi/yt-dlp/json /tmp/yt-dlp-latest.json
+RUN pip install --no-cache-dir -U "yt-dlp[default]" && deno --version
+
 COPY bot.py downloader.py database.py lyrics.py ./
 
 # База SQLite и временные файлы
