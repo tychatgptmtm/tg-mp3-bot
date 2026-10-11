@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -186,10 +187,14 @@ def _base_opts() -> dict:
         "noprogress": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 25,
+        "socket_timeout": 15,
         "nocheckcertificate": True,
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 1,
+        # YouTube режет скорость при потоковой загрузке — качаем кусками
+        "http_chunk_size": 10 * 1024 * 1024,
+        "cachedir": os.path.join(tempfile.gettempdir(), "yt-dlp-cache"),
         # JS-рантайм для YouTube (решение n/sig-челленджей). Deno ставится в Dockerfile.
         "js_runtimes": {"deno": {}, "node": {}},
     }
@@ -213,7 +218,7 @@ def _probe_sync(url: str, clients=None):
         return ydl.extract_info(url, download=False)
 
 
-def _download_sync(url: str, tmp: str, quality: int, hook, clients=None):
+def _dl_opts(tmp: str, quality: int, hook, clients=None) -> dict:
     opts = _base_opts()
     opts.update({
         "format": "bestaudio/best",
@@ -228,20 +233,49 @@ def _download_sync(url: str, tmp: str, quality: int, hook, clients=None):
         "progress_hooks": [hook] if hook else [],
     })
     _apply_clients(opts, clients)
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    return opts
+
+
+def _download_sync(url: str, tmp: str, quality: int, hook, clients=None):
+    with yt_dlp.YoutubeDL(_dl_opts(tmp, quality, hook, clients)) as ydl:
         ydl.download([url])
+
+
+def _download_info_sync(info: dict, tmp: str, quality: int, hook, clients=None):
+    """Качает по уже полученной информации — без повторного разбора страницы
+    YouTube (это самая долгая часть: запросы к API + JS-челленджи)."""
+    with yt_dlp.YoutubeDL(_dl_opts(tmp, quality, hook, clients)) as ydl:
+        ydl.process_ie_result(ydl.sanitize_info(info), download=True)
 
 
 async def _run(func, *args):
     return await asyncio.get_running_loop().run_in_executor(_executor, func, *args)
 
 
+# клиент YouTube, который сработал последним, — пробуем его первым
+_last_good = {"clients": None, "set": False}
+
+
+def _ordered_clients(first=None):
+    order = list(YT_CLIENT_SETS)
+    pref = first if first is not None else (_last_good["clients"] if _last_good["set"] else None)
+    if pref in order:
+        order.remove(pref)
+        order.insert(0, pref)
+    return order
+
+
 async def _probe_with_fallback(url: str):
-    attempts = YT_CLIENT_SETS if _is_youtube(url) else [None]
+    yt = _is_youtube(url)
+    attempts = _ordered_clients() if yt else [None]
     err = None
     for clients in attempts:
         try:
+            t0 = time.monotonic()
             info = await _run(_probe_sync, url, clients)
+            log.warning("probe %s: клиент %s, %.1f с", url[:60], clients, time.monotonic() - t0)
+            if yt and not url.startswith("ytsearch"):
+                _last_good.update(clients=clients, set=True)
             return info, clients
         except Exception as e:
             err = e
@@ -251,9 +285,29 @@ async def _probe_with_fallback(url: str):
     raise err
 
 
-async def _download_with_fallback(url, tmp, quality, hook, clients) -> None:
-    attempts = YT_CLIENT_SETS if _is_youtube(url) else [None]
-    order = [clients] + [a for a in attempts if a != clients]
+def _clear_dir(tmp: str) -> None:
+    for f in os.listdir(tmp):
+        try:
+            os.remove(os.path.join(tmp, f))
+        except OSError:
+            pass
+
+
+async def _download_with_fallback(url, tmp, quality, hook, clients, info=None) -> None:
+    # 1) быстрый путь: качаем по уже полученной при проверке информации
+    if info and info.get("formats"):
+        try:
+            t0 = time.monotonic()
+            await _run(_download_info_sync, info, tmp, quality, hook, clients)
+            log.warning("download %s: %.1f с", url[:60], time.monotonic() - t0)
+            return
+        except Exception as e:
+            log.info("download(info) %s: %s", url[:80], str(e)[:120])
+            _clear_dir(tmp)
+            if not _is_retryable(e):
+                raise
+    # 2) запасной путь: заново разбираем ссылку, перебирая клиенты
+    order = _ordered_clients(clients) if _is_youtube(url) else [None]
     err = None
     for c in order:
         try:
@@ -515,7 +569,7 @@ async def _process_url(url: str, preferred_quality: int = 192, progress_cb=None,
     hook = _make_hook(loop, progress_cb, html.escape(title))
     tmp = tempfile.mkdtemp(prefix="mp3bot_")
     try:
-        await _download_with_fallback(url, tmp, quality, hook, clients)
+        await _download_with_fallback(url, tmp, quality, hook, clients, info)
     except Exception as e:
         shutil.rmtree(tmp, ignore_errors=True)
         raise DownloadError(_friendly_error(e))
